@@ -1,0 +1,58 @@
+{
+  "demo_nodes_cpp": {
+    "repository": "https://github.com/ros2/demos",
+    "revision": "1fc7a62ee591e4c4a7f84e72aa4b33de11f6fbf3",
+    "files": {
+      "upstream/demo_nodes_cpp/src/topics/talker.cpp": {
+        "url": "https://raw.githubusercontent.com/ros2/demos/1fc7a62ee591e4c4a7f84e72aa4b33de11f6fbf3/demo_nodes_cpp/src/topics/talker.cpp",
+        "sha256": "ebb641b113db680e1d9848a197f9c2ce357025a3e68bd92fc28bb9e4b83244ea"
+      },
+      "upstream/demo_nodes_cpp/src/topics/listener.cpp": {
+        "url": "https://raw.githubusercontent.com/ros2/demos/1fc7a62ee591e4c4a7f84e72aa4b33de11f6fbf3/demo_nodes_cpp/src/topics/listener.cpp",
+        "sha256": "16ca850d16012e1a96f951b2fdd27f04a5bb56a4ef108ce413eb851b9ff650fb"
+      },
+      "upstream/demo_nodes_cpp/include/demo_nodes_cpp/visibility_control.h": {
+        "url": "https://raw.githubusercontent.com/ros2/demos/1fc7a62ee591e4c4a7f84e72aa4b33de11f6fbf3/demo_nodes_cpp/include/demo_nodes_cpp/visibility_control.h",
+        "sha256": "264e81320c4f2a1580b3b166e2ee652a765841891d640b3ca44b8b2a525202ab"
+      },
+      "upstream/demo_nodes_cpp/LICENSE": {
+        "url": "https://raw.githubusercontent.com/ros2/demos/1fc7a62ee591e4c4a7f84e72aa4b33de11f6fbf3/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    }
+  },
+  "topic_tools": {
+    "repository": "https://github.com/ros-tooling/topic_tools",
+    "revision": "0fc927b7c0af0aaffae34a947b6ea4a7f9f97c94",
+    "files": {
+      "upstream/topic_tools/src/relay.cpp": {
+        "url": "https://raw.githubusercontent.com/ros-tooling/topic_tools/0fc927b7c0af0aaffae34a947b6ea4a7f9f97c94/topic_tools/src/relay.cpp",
+        "sha256": "f12d7c75ce8a83f4ebcb83a5f67b0720cd5de2251328faf9ccc13ab7b1032003"
+      },
+      "upstream/topic_tools/src/relay_node.cpp": {
+        "url": "https://raw.githubusercontent.com/ros-tooling/topic_tools/0fc927b7c0af0aaffae34a947b6ea4a7f9f97c94/topic_tools/src/relay_node.cpp",
+        "sha256": "c461460b829598c8a504726f74eb3a55979be7747c33efa4f10f19d448597740"
+      },
+      "upstream/topic_tools/src/tool_base_node.cpp": {
+        "url": "https://raw.githubusercontent.com/ros-tooling/topic_tools/0fc927b7c0af0aaffae34a947b6ea4a7f9f97c94/topic_tools/src/tool_base_node.cpp",
+        "sha256": "b40df8710d1b33e0919dbfd3813625cfbb38cca1a65d7b7d7973a5aecb4a838e"
+      },
+      "upstream/topic_tools/include/topic_tools/relay_node.hpp": {
+        "url": "https://raw.githubusercontent.com/ros-tooling/topic_tools/0fc927b7c0af0aaffae34a947b6ea4a7f9f97c94/topic_tools/include/topic_tools/relay_node.hpp",
+        "sha256": "398fa08bd625c7ad29b0b842bac13024001631afcd355bcdf3a5c08c5bf762a9"
+      },
+      "upstream/topic_tools/include/topic_tools/tool_base_node.hpp": {
+        "url": "https://raw.githubusercontent.com/ros-tooling/topic_tools/0fc927b7c0af0aaffae34a947b6ea4a7f9f97c94/topic_tools/include/topic_tools/tool_base_node.hpp",
+        "sha256": "e77c98a7dec73016d6b01b853bb7707ed926a5709e693f05fa7203eea0a836cb"
+      },
+      "upstream/topic_tools/include/topic_tools/visibility_control.h": {
+        "url": "https://raw.githubusercontent.com/ros-tooling/topic_tools/0fc927b7c0af0aaffae34a947b6ea4a7f9f97c94/topic_tools/include/topic_tools/visibility_control.h",
+        "sha256": "0338516903e94eb6f841d3c57919d5970867a2edc29502dd7341f88e3afa6264"
+      },
+      "upstream/topic_tools/LICENSE": {
+        "url": "https://raw.githubusercontent.com/ros-tooling/topic_tools/0fc927b7c0af0aaffae34a947b6ea4a7f9f97c94/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    }
+  }
+}

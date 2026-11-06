@@ -1,0 +1,159 @@
+--- a/demo_nodes_cpp/src/topics/talker.cpp
++++ b/demo_nodes_cpp/src/topics/talker.cpp
+@@ -12,6 +12,8 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// RobotTrace 修改：加入限定的事件采集和实验控制，原始版本见 upstream.json。
++#include "trace.hpp"
+ #include <chrono>
+ #include <cstdio>
+ #include <memory>
+@@ -42,12 +44,22 @@
+     auto publish_message =
+       [this]() -> void
+       {
++        trace_.ready(0, pub_->get_subscription_count(), "null",
++          rt_external::qos(pub_->get_actual_qos()));
++        if (!control_.permit(count_)) return;
++        const auto generated = robottrace::now();
+         msg_ = std::make_unique<std_msgs::msg::String>();
+         msg_->data = "Hello World: " + std::to_string(count_++);
++        const auto seq = trace_.accept(msg_->data);
++        if (!seq) return;
++        trace_.record_at(seq, robottrace::Kind::Generate, generated);
+         RCLCPP_INFO(this->get_logger(), "Publishing: '%s'", msg_->data.c_str());
+         // Put the message into a queue to be processed by the middleware.
+         // This call is non-blocking.
++        trace_.record(seq, robottrace::Kind::PublishBegin);
+         pub_->publish(std::move(msg_));
++        trace_.record(seq, robottrace::Kind::PublishEnd);
++        control_.published(seq, pub_->get_subscription_count());
+       };
+     // Create a publisher with a custom Quality of Service profile.
+     // Uniform initialization is suggested so it can be trivially changed to
+@@ -61,6 +73,8 @@
+   }
+ 
+ private:
++  rt_external::Trace trace_{"source"};
++  rt_external::ExperimentalControl control_;
+   size_t count_ = 1;
+   std::unique_ptr<std_msgs::msg::String> msg_;
+   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_;
+--- a/demo_nodes_cpp/src/topics/listener.cpp
++++ b/demo_nodes_cpp/src/topics/listener.cpp
+@@ -12,6 +12,8 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// RobotTrace 修改：加入限定的事件采集和实验控制，原始版本见 upstream.json。
++#include "trace.hpp"
+ #include "rclcpp/rclcpp.hpp"
+ #include "rclcpp_components/register_node_macro.hpp"
+ 
+@@ -36,16 +38,27 @@
+     auto callback =
+       [this](std_msgs::msg::String::ConstSharedPtr msg) -> void
+       {
++        const auto entry = robottrace::now();
++        const auto seq = trace_.accept(msg->data);
++        if (!seq) return;
++        trace_.record_at(seq, robottrace::Kind::Entry, entry);
+         RCLCPP_INFO(this->get_logger(), "I heard: [%s]", msg->data.c_str());
++        trace_.record(seq, robottrace::Kind::Exit);
++        trace_.delivered(seq);
+       };
+     // Create a subscription to the topic which can be matched with one or more compatible ROS
+     // publishers.
+     // Note that not all publishers on the same topic with the same type will be compatible:
+     // they must have compatible Quality of Service policies.
+     sub_ = create_subscription<std_msgs::msg::String>("chatter", 10, callback);
++    readiness_timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() {
++      trace_.ready(sub_->get_publisher_count(), 0, rt_external::qos(sub_->get_actual_qos()));
++    });
+   }
+ 
+ private:
++  rt_external::Trace trace_{"consumer"};
++  rclcpp::TimerBase::SharedPtr readiness_timer_;
+   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_;
+ };
+ 
+--- a/topic_tools/include/topic_tools/relay_node.hpp
++++ b/topic_tools/include/topic_tools/relay_node.hpp
+@@ -15,6 +15,8 @@
+ #ifndef TOPIC_TOOLS__RELAY_NODE_HPP_
+ #define TOPIC_TOOLS__RELAY_NODE_HPP_
+ 
++// RobotTrace 修改：加入限定的事件采集和实验控制，原始版本见 upstream.json。
++#include "trace.hpp"
+ #include <memory>
+ #include <optional>  // NOLINT : https://github.com/ament/ament_lint/pull/324
+ #include <string>
+@@ -33,6 +35,8 @@
+   explicit RelayNode(const rclcpp::NodeOptions & options);
+ 
+ private:
++  rt_external::Trace trace_{"processor"};
++  void report_ready();
+   void process_message(std::shared_ptr<rclcpp::SerializedMessage> msg) override;
+ };
+ }  // namespace topic_tools
+--- a/topic_tools/src/relay_node.cpp
++++ b/topic_tools/src/relay_node.cpp
+@@ -12,6 +12,8 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// RobotTrace 修改：观测原始序列化转发，不重新编码输出。
++#include <std_msgs/msg/string.hpp>
+ #include <memory>
+ #include <optional> // NOLINT : https://github.com/ament/ament_lint/pull/324
+ #include <string>
+@@ -31,17 +33,41 @@
+ 
+   discovery_timer_ = this->create_wall_timer(
+     discovery_period_,
+-    std::bind(&RelayNode::make_subscribe_unsubscribe_decisions, this));
++    [this]() { make_subscribe_unsubscribe_decisions(); report_ready(); });
+ 
+   make_subscribe_unsubscribe_decisions();
++  report_ready();
++}
++
++void RelayNode::report_ready()
++{
++  trace_.ready(sub_ ? sub_->get_publisher_count() : 0, pub_ ? pub_->get_subscription_count() : 0,
++    sub_ ? rt_external::qos(sub_->get_actual_qos()) : "null",
++    pub_ ? rt_external::qos(pub_->get_actual_qos()) : "null");
+ }
+ 
+ void RelayNode::process_message(std::shared_ptr<rclcpp::SerializedMessage> msg)
+ {
+-  std::scoped_lock lock(pub_mutex_);
+-  if (pub_) {
+-    pub_->publish(*msg);
++  const auto entry = robottrace::now();
++  std_msgs::msg::String decoded;
++  try {
++    rclcpp::Serialization<std_msgs::msg::String>().deserialize_message(msg.get(), &decoded);
++  } catch (const std::exception &error) {
++    trace_.reject(error.what());
++    return;
+   }
++  const auto seq = trace_.accept(decoded.data);
++  if (!seq) return;
++  trace_.record_at(seq, robottrace::Kind::Entry, entry);
++  {
++    std::scoped_lock lock(pub_mutex_);
++    if (pub_) {
++      trace_.record(seq, robottrace::Kind::PublishBegin);
++      pub_->publish(*msg);
++      trace_.record(seq, robottrace::Kind::PublishEnd);
++    }
++  }
++  trace_.record(seq, robottrace::Kind::Exit);
+ }
+ 
+ }  // namespace topic_tools
