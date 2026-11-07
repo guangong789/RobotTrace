@@ -6,3 +6,6 @@ __pycache__/
 /install/
 /log/
 /.vscode/
+/.deps/
+/models/mnist/data/
+/models/mobilenet/data/

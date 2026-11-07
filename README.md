@@ -19,12 +19,13 @@ flowchart LR
     A --> K[Comparison Core: conditions, coverage and verdicts]
 ```
 
-The C++ collector reserves a bounded event buffer before callbacks and writes JSONL on normal shutdown. Python uses the standard library; analysis and comparison are pure computations behind file and CLI adapters. No host ROS installation or pip packages are required.
+The C++ collector reserves a bounded event buffer before callbacks and writes JSONL on normal shutdown. Python runtime analysis and comparison use the standard library. No host ROS installation is required; V2's one-time independent fixture preparation uses the external Python packages documented below.
 
-Two integrations are supported:
+The following integrations are supported:
 
 - **Controlled pipeline:** three C++ processes, preserved message identity, configurable publish rate and processor work; normal and slow presets.
 - **Instrumented upstream application:** pinned ROS2 demos Talker → topic_tools Relay → Listener, using the original serialized forwarding path. Normal and Late-Relay scenarios use 20 source messages at the upstream nominal 1 Hz. This is a rebuilt application with explicit instrumentation, not tracing of unmodified binaries.
+- **V2 CPU inference:** MobileNetV2-12 FP32 through ONNX Runtime CPU 1.20.1, with two real-image tensor fixtures, independent full-output references, three ROS2 processes and identity-paired load/latency analysis. See [setup, correctness, runtime commands and limitations](docs/inference-experiment.md).
 
 ## Prerequisites and clean build
 
@@ -85,6 +86,8 @@ The only supported deliberate configuration change is `processor_work_ms`. Undec
 
 Verdicts describe observed P95 improvement, regression or equality; incomplete evidence withholds verdicts. They do not establish statistical significance or isolate a root cause. See [comparison semantics](docs/comparison-semantics.md).
 
+V2 exposes Processor intra-op settings 1 and 4, keeping one Session and five warm-up calls. Bounded experiments observed lower API/callback duration, lower Consumer Age in available low-load comparisons, and higher observed result coverage near 90 Hz with four threads. Tail variability and an intermittent readiness failure remain; neither acceleration nor complete 90 Hz coverage is guaranteed. These descriptive inference results do not extend the V1 Comparison Core policy.
+
 ## Evidence-quality semantics
 
 - **Execution:** whether the run completed.
@@ -106,7 +109,7 @@ python3 -B tests/comparison_integration.py
 /usr/bin/python3 -B tests/upstream_integration.py
 ```
 
-The unit suite does not require ROS or Docker. Real integration suites require the corresponding builds and create fresh bounded evidence. They cover normal/slow behavior, a derived missing-observation fixture, comparison acceptance/rejection, and upstream Normal/Late-Relay behavior. Assertions check evidence semantics rather than exact ROS scheduling or an improvement percentage.
+The unit suite does not require ROS or Docker; inference tests require the prepared MobileNetV2 fixtures from the [V2 setup](docs/inference-experiment.md). Real integration suites require the corresponding builds and create fresh bounded evidence. They cover normal/slow behavior, a derived missing-observation fixture, comparison acceptance/rejection, and upstream Normal/Late-Relay behavior. Assertions check evidence semantics rather than exact ROS scheduling or an improvement percentage. Standalone CTest and inference C++ contracts are described in the V2 guide.
 
 ## Source and local artifacts
 
