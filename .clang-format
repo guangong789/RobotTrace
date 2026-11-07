@@ -7,6 +7,7 @@ SeparateDefinitionBlocks: Always
 UseTab: Never
 ColumnLimit: 88
 NamespaceIndentation: All
+FixNamespaceComments: false
 AccessModifierOffset: -4
 IndentCaseLabels: true
 AllowShortBlocksOnASingleLine: Never

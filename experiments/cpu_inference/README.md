@@ -50,3 +50,6 @@ CPU/编译器/运行环境、进程退出状态、原始 JSON 和 stderr。实�
 
 独立程序与 ROS2 使用共享模型构造入口，默认设置均为 1。共享头文件哈希变化后，
 运行 ROS2 前须遵守原有构建溯源校验并重建；standalone 的构建和测试独立进行。
+
+可选 `--resource-phases` 仅用于固定的 Session/warm-up/active/idle CPU 成本归因，
+边界、时钟、条件 spinning 对照和局限见 [资源实验说明](RESOURCE_COST.md)。

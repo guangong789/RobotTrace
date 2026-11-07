@@ -36,4 +36,4 @@ namespace rt_external {
             return value;
         }
     };
-} // namespace rt_external
+}

@@ -100,4 +100,4 @@ namespace rt_external {
                         ",\"timestamp_ns\":" + std::to_string(robottrace::now()) + "}");
         }
     };
-} // namespace rt_external
+}

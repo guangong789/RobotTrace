@@ -89,4 +89,4 @@ namespace inference {
             return true;
         }
     };
-} // namespace inference
+}

@@ -158,4 +158,4 @@ namespace robottrace {
                        // 不保证崩溃后的数据持久性。
         }
     };
-} // robottrace 命名空间
+}

@@ -1,7 +1,7 @@
 #pragma once
-// 固定 MobileNetV2 的两份照片张量；不提供通用模型或张量接口。
 #include <onnxruntime_cxx_api.h>
 #include <cpu_provider_factory.h>
+#include <onnxruntime_session_options_config_keys.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -81,23 +81,60 @@ namespace vision {
         Logits logits{};
     };
 
+    // 仅 standalone 资源模式传入；默认调用不读 CPU 时钟或改变 spinning。
+    inline uint64_t process_cpu_ns() {
+        timespec value{};
+        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value))
+            throw std::runtime_error("CLOCK_PROCESS_CPUTIME_ID failed");
+        return uint64_t(value.tv_sec) * 1000000000ULL + uint64_t(value.tv_nsec);
+    }
+
+    struct SessionConstructionMeasurement {
+        uint64_t wall_begin = 0, cpu_begin = 0, cpu_end = 0, wall_end = 0;
+        bool created = false, spinning_explicit = false, spinning_entry_present = false;
+        std::string spinning_entry;
+    };
+
     class CpuModel {
         Ort::Env environment_{ORT_LOGGING_LEVEL_WARNING, "robottrace-vision"};
         std::unique_ptr<Ort::Session> session_;
         int applied_intra_op_num_threads_ = 0;
 
     public:
-        explicit CpuModel(const std::string &path, int intra_op_num_threads = 1) {
+        explicit CpuModel(const std::string &path, int intra_op_num_threads = 1,
+            SessionConstructionMeasurement *measurement = nullptr,
+            bool disable_intra_op_spinning = false) {
             if (intra_op_num_threads <= 0)
                 throw std::invalid_argument("intra_op_num_threads must be positive");
+            if (disable_intra_op_spinning && !measurement)
+                throw std::invalid_argument("Spinning experiment requires resource phases");
             Ort::SessionOptions options;
             options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
             options.SetIntraOpNumThreads(intra_op_num_threads);
             options.SetInterOpNumThreads(1);
             options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
             Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CPU(options, 1));
+            if (disable_intra_op_spinning)
+                options.AddConfigEntry(kOrtSessionOptionsConfigAllowIntraOpSpinning, "0");
+            if (measurement) {
+                measurement->spinning_explicit = disable_intra_op_spinning;
+                measurement->spinning_entry_present =
+                    options.HasConfigEntry(kOrtSessionOptionsConfigAllowIntraOpSpinning);
+                if (measurement->spinning_entry_present)
+                    measurement->spinning_entry =
+                        options.GetConfigEntry(kOrtSessionOptionsConfigAllowIntraOpSpinning);
+                if (disable_intra_op_spinning && measurement->spinning_entry != "0")
+                    throw std::runtime_error("Spinning option readback mismatch");
+                measurement->wall_begin = clock_ns();
+                measurement->cpu_begin = process_cpu_ns();
+            }
             session_ =
                 std::make_unique<Ort::Session>(environment_, path.c_str(), options);
+            if (measurement) {
+                measurement->cpu_end = process_cpu_ns();
+                measurement->wall_end = clock_ns();
+                measurement->created = true;
+            }
             if (std::string(Ort::GetVersionString()) != "1.20.1" ||
                 session_->GetInputCount() != 1 || session_->GetOutputCount() != 1)
                 throw std::runtime_error("Runtime/model contract mismatch");
@@ -128,6 +165,10 @@ namespace vision {
             return applied_intra_op_num_threads_;
         }
 
+        bool session_alive() const {
+            return session_ != nullptr;
+        }
+
         void run(Tensor &input, Call &call) {
             const std::array<int64_t, 4> shape{1, 3, 224, 224};
             auto memory =
@@ -151,4 +192,4 @@ namespace vision {
             call.output_available = true;
         }
     };
-} // namespace vision
+}
