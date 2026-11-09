@@ -32,7 +32,11 @@ ATOL, RTOL = 1e-4, 1e-4
 ROLES = ("consumer", "processor", "source")
 
 def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    value = hashlib.sha256()
+    with Path(path).open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
 
 
 def read(path):
@@ -75,65 +79,124 @@ def fixture_data():
     return outputs, hashes
 
 
-def record_build():
-    if (
-        digest(MODEL) != MODEL_SHA
-        or (SDK / "VERSION_NUMBER").read_text().strip() != "1.20.1"
-    ):
-        raise ValueError("Wrong model or CPU SDK")
-    fixture_data()
+def build_sources(provider="cpu"):
     inputs = [p for p in APP.rglob("*") if p.is_file()]
-    inputs += [
-        ROOT / "scripts/build-inference.sh",
-        ROOT / "tests/inference_contract.cpp",
-        ROOT / "ros2/robottrace_examples/include/robottrace/events.hpp",
-        ROOT / "experiments/cpu_inference/mobilenet.hpp",
-        FIXTURES / "fixtures.json",
-        FIXTURES / "prepare.py",
-    ]
-    artifacts = [p for p in (BIN / "lib").rglob("*") if p.is_file()]
-    artifacts += [MODEL, SDK / "lib/libonnxruntime.so.1.20.1"]
-    artifacts += [
-        FIXTURES / "data" / name for name in read(FIXTURES / "fixtures.json")["files"]
-    ]
-    write(
-        BIN / "build.json",
-        {
-            "files": {
-                str(p.relative_to(ROOT)): digest(p)
-                for p in sorted(set(inputs + artifacts))
-            },
-            "compiler": subprocess.check_output(
-                ["g++", "--version"], text=True, timeout=5
-            ).splitlines()[0],
-            "cxx_standard": 17,
-            "onnxruntime": "1.20.1",
-            "provider": "CPUExecutionProvider",
-            "versions": subprocess.check_output(
-                [
-                    "dpkg-query",
-                    "-W",
-                    "ros-humble-rclcpp",
-                    "ros-humble-rmw-fastrtps-cpp",
-                    "ros-humble-rmw-fastrtps-shared-cpp",
-                    "ros-humble-fastrtps",
-                    "ros-humble-rosidl-typesupport-cpp",
-                ],
-                text=True,
-                timeout=5,
-            ),
-        },
-    )
+    inputs += [ROOT / name for name in (
+        "scripts/build-inference.sh", "tests/inference_contract.cpp",
+        "ros2/robottrace_examples/include/robottrace/events.hpp",
+        "experiments/cpu_inference/mobilenet.hpp", "models/mobilenet/fixtures.json",
+        "models/mobilenet/prepare.py",
+    )]
+    if provider == "cuda":
+        inputs += [ROOT / name for name in (
+            "robottrace/inference_cuda.py", "scripts/build-inference-gpu.sh",
+            "scripts/ros-inference-gpu.sh",
+        )]
+    return inputs
 
 
-def verify_artifacts():
-    value = read(BIN / "build.json")
+def build_artifacts(directory, provider="cpu"):
+    from . import inference_cuda as cuda
+    artifacts = [p for p in (directory / "lib").rglob("*") if p.is_file()]
+    artifacts += [MODEL, *[FIXTURES / "data" / name for name in read(FIXTURES / "fixtures.json")["files"]]]
+    if provider == "cpu":
+        artifacts += [SDK / "lib/libonnxruntime.so.1.20.1"]
+    else:
+        artifacts += [cuda.GPU_SDK / "lib" / name for name in cuda.GPU_HASHES]
+        artifacts += [p for p in cuda.CUDNN.glob("*.so.*") if p.is_file() and not p.is_symlink()]
+    return artifacts
+
+
+def validate_provider(provider, threads):
+    if provider not in ("cpu", "cuda"):
+        raise ValueError("provider must be cpu or cuda")
+    validate_intra_op_threads(threads)
+    if provider == "cuda" and threads != 1:
+        raise ValueError("CUDA requires one host thread")
+    return provider
+
+
+def record_build(provider="cpu", artifact_root=None):
+    from . import inference_cuda as cuda
+    if provider not in ("cpu", "cuda"):
+        raise ValueError("Invalid build provider")
+    if provider == "cuda" and artifact_root is None:
+        raise ValueError("CUDA build requires a separate artifact directory")
+    directory = Path(artifact_root) if artifact_root is not None else BIN
+    sdk = SDK if provider == "cpu" else cuda.GPU_SDK
+    if digest(MODEL) != MODEL_SHA or (sdk / "VERSION_NUMBER").read_text().strip() != "1.20.1":
+        raise ValueError("Wrong model or SDK")
+    fixture_data()
+    inputs = build_sources(provider)
+    artifacts = build_artifacts(directory, provider)
+    value = {
+        "files": {str(p.relative_to(ROOT)): digest(p) for p in sorted(set(inputs + artifacts))},
+        "compiler": subprocess.check_output(["g++", "--version"], text=True, timeout=5).splitlines()[0],
+        "cxx_standard": 17, "onnxruntime": "1.20.1", "build_mode": provider,
+        "provider": "CPUExecutionProvider" if provider == "cpu" else "CUDAExecutionProvider",
+        "versions": subprocess.check_output([
+            "dpkg-query", "-W", "ros-humble-rclcpp", "ros-humble-rmw-fastrtps-cpp",
+            "ros-humble-rmw-fastrtps-shared-cpp", "ros-humble-fastrtps",
+            "ros-humble-rosidl-typesupport-cpp",
+        ], text=True, timeout=5),
+    }
+    if provider == "cuda":
+        for name, expected in cuda.GPU_HASHES.items():
+            if digest(cuda.GPU_SDK / "lib" / name) != expected:
+                raise ValueError("Unexpected GPU SDK identity")
+        value["cuda_runtime"] = {name: cuda.digest(path) for name, path in cuda.cuda_runtime_paths().items()}
+        value["runtime_sdk_root"] = "/opt/rt/ort"
+    write(directory / "build.json", value)
+
+
+def verify_artifacts(artifact_root=None, *, provider="cpu", source_root=None):
+    from . import inference_cuda as cuda
+    if provider not in ("cpu", "cuda"):
+        raise ValueError("Invalid artifact provider")
+    directory = Path(artifact_root) if artifact_root is not None else BIN
+    if not directory.is_absolute():
+        directory = ROOT / directory
+    directory = directory.resolve(strict=True)
+    if not directory.is_relative_to(ROOT / "bin"):
+        raise ValueError("Artifact directory must be under bin/")
+    binary = directory / "lib/robottrace_inference" / (
+        "inference_pipeline_cuda" if provider == "cuda" else "inference_pipeline")
+    if not binary.is_file() or binary.is_symlink():
+        raise ValueError("Missing/mismatched inference executable")
+    value = read(directory / "build.json")
+    expected_provider = "CPUExecutionProvider" if provider == "cpu" else "CUDAExecutionProvider"
+    if value.get("provider") != expected_provider or value.get("onnxruntime") != "1.20.1" or value.get("build_mode", "cpu") != provider:
+        raise ValueError("Artifact/provider identity mismatch")
+    sources = build_sources(provider)
+    expected_files = {str(path.relative_to(ROOT)) for path in sources + build_artifacts(directory, provider)}
+    if not isinstance(value.get("files"), dict) or set(value["files"]) != expected_files:
+        raise ValueError("Missing/unexpected build identity entries")
+    frozen_names = {str(path.relative_to(ROOT)) for path in sources
+                    if path.relative_to(ROOT).parts[0] in ("ros2", "experiments", "scripts", "tests")}
+    if source_root is not None:
+        source_root = Path(source_root).resolve(strict=True)
+        if artifact_root is None or provider != "cpu" or not source_root.is_relative_to(ROOT) or not source_root.is_dir():
+            raise ValueError("Frozen CPU sources require an explicit artifact root and local source directory")
     for name, expected in value["files"].items():
-        if digest(ROOT / name) != expected:
+        path = ROOT / name
+        if source_root is not None and name in frozen_names:
+            path = source_root / name
+            if path.is_symlink() or not path.resolve(strict=True).is_relative_to(source_root):
+                raise ValueError("Unsafe frozen CPU source path")
+        if digest(path) != expected:
             raise ValueError("Build input/artifact changed; rebuild inference: " + name)
     if digest(MODEL) != MODEL_SHA:
         raise ValueError("Wrong inference model")
     fixture_data()
+    if provider == "cuda":
+        if value.get("runtime_sdk_root") != "/opt/rt/ort" or set(value.get("cuda_runtime", {})) != set(cuda.CUDA_SONAMES):
+            raise ValueError("Missing CUDA runtime identity")
+        for name, expected in cuda.GPU_HASHES.items():
+            if digest(cuda.GPU_SDK / "lib" / name) != expected:
+                raise ValueError("GPU SDK identity mismatch")
+        for name, path in cuda.cuda_runtime_paths().items():
+            if cuda.digest(path) != value["cuda_runtime"][name]:
+                raise ValueError("CUDA runtime identity mismatch: " + name)
     return value
 
 
@@ -429,8 +492,38 @@ def validate_intra_op_threads(value):
     return value
 
 
-def verify_processor_configuration(value, requested):
+def verify_processor_configuration(value, requested, *, provider="cpu", expected_pid=None):
     """检查实际进程完成 ORT 配置后的证据，不把请求参数当作应用证明。"""
+    if provider == "cuda":
+        from . import inference_cuda as cuda
+        validate_provider(provider, requested)
+        required = dict(requested_provider="cuda", build_mode="cuda", provider="CUDAExecutionProvider",
+                        onnxruntime="1.20.1", requested_intra_op_threads=1, intra_op_threads=1,
+                        inter_op_threads=1, execution_mode="sequential", graph_optimization="basic",
+                        provider_registered=True, session_created=True, sdk_root="/opt/rt/ort")
+        if not isinstance(value, dict) or any(type(value.get(k)) is not type(v) or value.get(k) != v for k, v in required.items()):
+            raise ValueError("Processor applied CUDA configuration mismatch")
+        raw = value.get("cuda_options_readback")
+        if not isinstance(raw, str):
+            raise ValueError("Missing CUDA provider readback")
+        pairs = [field.split("=", 1) for field in raw.split(";") if field]
+        if any(len(pair) != 2 for pair in pairs) or len({pair[0] for pair in pairs}) != len(pairs):
+            raise ValueError("Ambiguous CUDA provider readback")
+        options = dict(pairs)
+        if options.get("device_id") != "0" or options.get("use_tf32") != "0":
+            raise ValueError("CUDA provider options mismatch")
+        proof = value.get("warmup_execution")
+        if not isinstance(proof, dict) or type(expected_pid) is not int:
+            raise ValueError("Missing CUDA execution proof/process identity")
+        actual = cuda.validate_profile(cuda.read_json(proof["profile_path"]), expected_pid)
+        if any(proof.get(k) != v for k, v in actual.items()) or cuda.digest(proof["profile_path"]) != proof.get("profile_sha256"):
+            raise ValueError("CUDA profile proof mismatch")
+        paths = [item["path"] for item in proof.get("loaded_libraries", [])]
+        if proof.get("loaded_libraries") != cuda.verify_loaded_libraries(paths, value["sdk_root"]):
+            raise ValueError("CUDA library evidence mismatch")
+        return deepcopy(value)
+    if provider != "cpu":
+        raise ValueError("Invalid Processor provider")
     expected = {
         "requested_intra_op_threads": validate_intra_op_threads(requested),
         "intra_op_threads": requested,
@@ -452,13 +545,19 @@ def verify_processor_configuration(value, requested):
 
 def run_experiment(
     parent, count=20, rate=5, startup_only=False, intra_op_threads=1,
+    *, provider="cpu", cpu_artifact_dir=None, cuda_artifact_dir=None, cpu_source_root=None,
 ):
     validate_workload(count, rate)
-    validate_intra_op_threads(intra_op_threads)
+    validate_provider(provider, intra_op_threads)
+    if provider == "cuda" and cuda_artifact_dir is None:
+        raise ValueError("CUDA requires an explicit artifact directory")
+    cpu_directory = Path(cpu_artifact_dir) if cpu_artifact_dir is not None else BIN
+    gpu_directory = Path(cuda_artifact_dir) if cuda_artifact_dir is not None else None
     parent = Path(parent)
     parent.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex
-    out = parent / (("vision_startup_" if startup_only else "vision_cpu_") + run_id)
+    prefix = ("vision_startup_" if startup_only else "vision_cpu_") if provider == "cpu" else ("vision_cuda_startup_" if startup_only else "vision_cuda_")
+    out = parent / (prefix + run_id)
     out.mkdir()
     manifest = {
         "schema_version": 1,
@@ -515,6 +614,11 @@ def run_experiment(
         "processor_readiness_configuration_verified": False,
         "processor_status_configuration_verified": False,
     }
+    if provider == "cuda":
+        manifest["scenario"] = "vision-cuda-startup-only" if startup_only else "vision-cuda"
+        manifest["configuration"].update(requested_provider="cuda", provider="CUDAExecutionProvider", device_id=0, use_tf32=0)
+        manifest["configuration"].pop("cpu_arena")
+        manifest["command_environments"] = {}
     processes, error, last = {}, None, {}
     history = ReadinessHistory()
     with (parent / ".workload.lock").open("w") as lock, (out / "console.log").open(
@@ -522,7 +626,12 @@ def run_experiment(
     ) as log:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            manifest["software"] = verify_artifacts()
+            manifest["software"] = (
+                verify_artifacts() if cpu_artifact_dir is None and cpu_source_root is None
+                else verify_artifacts(cpu_directory, source_root=cpu_source_root)
+            )
+            if provider == "cuda":
+                manifest["processor_software"] = verify_artifacts(gpu_directory, provider="cuda")
             if os.environ.get("ROS_LOCALHOST_ONLY") != "1":
                 raise ValueError("Inference requires ROS_LOCALHOST_ONLY=1")
             _, hashes = fixture_data()
@@ -540,7 +649,10 @@ def run_experiment(
 
             def launch(role):
                 command = [
-                    str(PROGRAM),
+                    str(gpu_directory / "lib/robottrace_inference/inference_pipeline_cuda"
+                        if provider == "cuda" and role == "processor"
+                        else PROGRAM if cpu_artifact_dir is None
+                        else cpu_directory / "lib/robottrace_inference/inference_pipeline"),
                     role,
                     run_id,
                     str(out),
@@ -551,12 +663,24 @@ def run_experiment(
                 ]
                 if role == "processor":
                     command += ["--intra-op-threads", str(intra_op_threads)]
+                if provider == "cuda" and role == "processor":
+                    command += ["--provider", "cuda"]
                 manifest["commands"][role] = command
+                launch_options = {}
+                if provider == "cuda" or cpu_artifact_dir is not None:
+                    if provider == "cuda" and role == "processor":
+                        library_path = f"{gpu_directory}/lib:/opt/rt/ort/lib:/opt/rt/cudnn:/opt/rt/cuda:/opt/ros/humble/lib"
+                    else:
+                        library_path = f"{cpu_directory}/lib:{SDK}/lib:/opt/ros/humble/lib"
+                    launch_options["env"] = dict(os.environ, LD_LIBRARY_PATH=library_path)
+                    if provider == "cuda":
+                        manifest["command_environments"][role] = {"LD_LIBRARY_PATH": library_path}
                 processes[role] = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
+                    **launch_options,
                 )
                 manifest["phases"].append(
                     {
@@ -580,7 +704,8 @@ def run_experiment(
                         raise ValueError("Wrong initialized process/run identity: " + role)
                     if role == "processor":
                         manifest["processor_configuration"] = verify_processor_configuration(
-                            value.get("inference_configuration"), intra_op_threads
+                            value.get("inference_configuration"), intra_op_threads,
+                            **({"provider": "cuda", "expected_pid": processes[role].pid} if provider == "cuda" else {})
                         )
                     return True
 
@@ -598,9 +723,8 @@ def run_experiment(
                 states = endpoint_ready(out, ROLES, last, history)
                 processor = last.get("processor")
                 if isinstance(processor, dict) and processor.get("initialized") is True:
-                    applied = verify_processor_configuration(
-                        processor.get("inference_configuration"), intra_op_threads
-                    )
+                    applied = (deepcopy(processor.get("inference_configuration")) if provider == "cuda"
+                               else verify_processor_configuration(processor.get("inference_configuration"), intra_op_threads))
                     if applied != manifest["processor_configuration"]:
                         raise ValueError("Processor configuration changed during startup")
                     manifest["processor_readiness_configuration_verified"] = True
@@ -671,7 +795,8 @@ def run_experiment(
                         raise ValueError("Wrong process status")
                     if role == "processor":
                         applied = verify_processor_configuration(
-                            node.get("inference_configuration"), intra_op_threads
+                            node.get("inference_configuration"), intra_op_threads,
+                            **({"provider": "cuda", "expected_pid": processes[role].pid} if provider == "cuda" else {})
                         )
                         if applied != manifest["processor_configuration"]:
                             raise ValueError("Processor configuration changed before shutdown")
@@ -782,6 +907,10 @@ def run_experiment(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--provider", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--cpu-artifact-dir")
+    parser.add_argument("--cpu-source-root")
+    parser.add_argument("--cuda-artifact-dir")
     parser.add_argument("--count", type=int, default=20)
     parser.add_argument("--rate", type=float, default=5)
     parser.add_argument("--intra-op-threads", type=int, choices=(1, 4), default=1)
@@ -794,10 +923,17 @@ def main():
     parser.add_argument("--record-build", action="store_true")
     args = parser.parse_args()
     if args.record_build:
-        record_build()
+        record_build(provider=args.provider, artifact_root=args.cuda_artifact_dir if args.provider == "cuda" else args.cpu_artifact_dir)
         return 0
     try:
         validate_workload(args.count, args.rate)
+        validate_provider(args.provider, args.intra_op_threads)
+        if args.cpu_source_root is not None and args.cpu_artifact_dir is None:
+            raise ValueError("--cpu-source-root requires --cpu-artifact-dir")
+        if args.provider == "cuda" and args.cuda_artifact_dir is None:
+            raise ValueError("CUDA requires --cuda-artifact-dir")
+        if args.provider == "cpu" and args.cuda_artifact_dir is not None:
+            raise ValueError("CUDA artifacts require --provider cuda")
     except ValueError as error:
         parser.error(str(error))
     if not args.inside:
@@ -810,12 +946,31 @@ def main():
             text=True,
             timeout=10,
         ).strip()
-        return subprocess.call(
-            [
-                str(ROOT / "scripts/ros.sh"),
+        cpu_directory = Path(args.cpu_artifact_dir) if args.cpu_artifact_dir else BIN
+        if not cpu_directory.is_absolute():
+            cpu_directory = ROOT / cpu_directory
+        inside_options = []
+        for option, value in (("--cpu-artifact-dir", args.cpu_artifact_dir), ("--cpu-source-root", args.cpu_source_root), ("--cuda-artifact-dir", args.cuda_artifact_dir)):
+            if value is not None:
+                path = Path(value)
+                path = path if path.is_absolute() else ROOT / path
+                inside_options += [option, "/work/" + str(path.resolve(strict=True).relative_to(ROOT))]
+        launch_env = None
+        evidence_options = []
+        if args.provider == "cuda":
+            verify_artifacts(cpu_directory, source_root=args.cpu_source_root)
+            verify_artifacts(Path(args.cuda_artifact_dir), provider="cuda")
+            parent = ROOT / "evidence" / ("vision_cuda_runs_" + uuid.uuid4().hex)
+            parent.mkdir()
+            launch_env = dict(os.environ, ROBOTTRACE_EVIDENCE_DIR=str(parent))
+            evidence_options = ["ROBOTTRACE_INFERENCE_EVIDENCE_PARENT=/work/" + str(parent.relative_to(ROOT))]
+            inside_options += ["--provider", "cuda"]
+        command = [
+                str(ROOT / ("scripts/ros-inference-gpu.sh" if args.provider == "cuda" else "scripts/ros.sh")),
                 "env",
                 "ROS_LOCALHOST_ONLY=1",
-                "LD_LIBRARY_PATH=/work/bin/inference/lib:/work/.deps/onnxruntime-linux-x64-1.20.1/lib:/opt/ros/humble/lib",
+                "LD_LIBRARY_PATH=/work/" + str(cpu_directory.relative_to(ROOT)) + "/lib:/work/.deps/onnxruntime-linux-x64-1.20.1/lib:/opt/ros/humble/lib",
+                *evidence_options,
                 "ROBOTTRACE_HOST_CLOCK="
                 + json.dumps({"boot_id": boot, "offsets": offsets}),
                 "ROBOTTRACE_IMAGE_ID=" + image_id,
@@ -835,10 +990,15 @@ def main():
                 "--intra-op-threads",
                 str(args.intra_op_threads),
                 *(["--startup-only"] if args.startup_only else []),
+                *inside_options,
             ]
-        )
+        return subprocess.call(command, **({"env": launch_env} if launch_env is not None else {}))
     path, analysis = run_experiment(
-        ROOT / "evidence", args.count, args.rate, args.startup_only, args.intra_op_threads,
+        Path(os.environ.get("ROBOTTRACE_INFERENCE_EVIDENCE_PARENT", ROOT / "evidence")),
+        args.count, args.rate, args.startup_only, args.intra_op_threads,
+        **({"provider": args.provider, "cpu_artifact_dir": args.cpu_artifact_dir,
+            "cuda_artifact_dir": args.cuda_artifact_dir, "cpu_source_root": args.cpu_source_root}
+           if args.provider == "cuda" or args.cpu_artifact_dir is not None else {}),
     )
     from .cli import display
 

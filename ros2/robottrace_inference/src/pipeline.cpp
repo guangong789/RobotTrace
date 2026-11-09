@@ -81,21 +81,31 @@ namespace {
 
 int main(int argc, char **argv) {
     try {
-        if (argc != 7 && argc != 8 && argc != 10)
+        if (argc < 7)
             throw std::runtime_error("Usage: inference_pipeline ROLE RUN OUTPUT COUNT "
-                                     "FIXTURES MODEL [RATE [--intra-op-threads 1|4]]");
+                                     "FIXTURES MODEL [RATE] [--intra-op-threads 1|4] "
+                                     "[--provider cpu|cuda] [--warmup-only]");
         const std::string role = argv[1], dir = argv[3], fixtures_path = argv[5],
                           model_path = argv[6];
         if (role != "source" && role != "processor" && role != "consumer")
             throw std::runtime_error("Invalid role");
-        int requested_threads = 1;
-        if (argc == 10) {
-            if (role != "processor" || std::string(argv[8]) != "--intra-op-threads")
-                throw std::invalid_argument("Only Processor accepts --intra-op-threads");
-            requested_threads = processor_threads(argv[9]);
+        int option_start = 7;
+        double rate = 5.0;
+        if (argc > 7 && std::string(argv[7]).rfind("--", 0) != 0) {
+            rate = std::stod(argv[7]);
+            option_start = 8;
         }
+#ifdef ROBOTTRACE_CUDA_BUILD
+        constexpr bool cuda_build = true;
+#else
+        constexpr bool cuda_build = false;
+#endif
+        std::vector<std::string> arguments;
+        for (int i = option_start; i < argc; ++i) arguments.emplace_back(argv[i]);
+        const auto requested = processor_options(role, arguments, cuda_build);
+        const int requested_threads = requested.threads;
         const Identity identity(argv[2], std::stoull(argv[4]));
-        const Schedule schedule(identity.count, argc >= 8 ? std::stod(argv[7]) : 5.0);
+        const Schedule schedule(identity.count, rate);
         const Clock clock;
         Buffer events(4096);
         const auto started = now();
@@ -114,10 +124,17 @@ int main(int argc, char **argv) {
             Fixtures fixtures(fixtures_path);
             std::unique_ptr<CpuModel> model;
             if (role == "processor") {
-                model = std::make_unique<CpuModel>(model_path, requested_threads);
+                vision::StandaloneSessionOptions cuda;
+                if (requested.provider == "cuda") {
+                    cuda.provider = "cuda";
+                    cuda.profile_prefix = dir + "/processor.warmup";
+                    model = std::make_unique<CpuModel>(model_path, requested_threads,
+                        nullptr, false, &cuda);
+                } else
+                    model = std::make_unique<CpuModel>(model_path, requested_threads);
                 model_loaded = now();
                 sessions = 1;
-                inference_configuration =
+                if (requested.provider == "cpu") inference_configuration =
                     "{\"requested_intra_op_threads\":" + std::to_string(requested_threads) +
                     ",\"intra_op_threads\":" + std::to_string(model->intra_op_num_threads()) +
                     ",\"inter_op_threads\":1,\"execution_mode\":\"sequential\","
@@ -125,15 +142,51 @@ int main(int argc, char **argv) {
                     "\"provider\":\"CPUExecutionProvider\",\"onnxruntime\":\"1.20.1\","
                     "\"applied_via\":\"ORT setter and Session construction succeeded\"}";
                 warmup_begin = now();
+                std::vector<Call> cuda_warmups;
                 for (uint32_t warmup = 0; warmup < 5; ++warmup) {
                     const auto sample = warmup % sample_count;
                     Call call;
                     model->run(fixtures.input[sample], call);
                     if (!fixtures.correct(call.logits, sample))
                         throw std::runtime_error("Warm-up reference mismatch");
+                    if (requested.provider == "cuda") cuda_warmups.push_back(call);
                     ++warmups;
                 }
                 warmup_end = now();
+                if (requested.provider == "cuda") {
+                    const auto profile = model->finish_profile();
+                    auto numerical = output(dir + "/processor.warmup-numerical.jsonl");
+                    numerical << std::setprecision(9);
+                    for (size_t i = 0; i < cuda_warmups.size(); ++i) {
+                        numerical << "{\"call_index\":" << i << ",\"sample_id\":"
+                                  << i % sample_count << ",\"logits\":[";
+                        for (size_t j = 0; j < cuda_warmups[i].logits.size(); ++j) {
+                            if (j) numerical << ',';
+                            numerical << cuda_warmups[i].logits[j];
+                        }
+                        numerical << "]}\n";
+                    }
+                    numerical.close();
+                    const auto execution = cuda_warmup_gate(dir, profile);
+                    inference_configuration =
+                        "{\"requested_provider\":\"cuda\",\"build_mode\":\"cuda\","
+                        "\"provider\":\"CUDAExecutionProvider\",\"onnxruntime\":\"1.20.1\","
+                        "\"requested_intra_op_threads\":1,\"intra_op_threads\":1,"
+                        "\"inter_op_threads\":1,\"execution_mode\":\"sequential\","
+                        "\"graph_optimization\":\"basic\",\"provider_registered\":" +
+                        std::string(cuda.provider_registered ? "true" : "false") +
+                        ",\"session_created\":" + (cuda.session_created ? "true" : "false") +
+                        ",\"sdk_root\":" + quote(ROBOTTRACE_ORT_ROOT) +
+                        ",\"cuda_options_readback\":" + quote(cuda.cuda_options) +
+                        ",\"warmup_execution\":" + execution + "}";
+                    if (requested.warmup_only) {
+                        atomic_json(dir + "/processor.initialization.json",
+                            "{\"ros_initialized\":false,\"session_initializations\":1,"
+                            "\"warmup_count\":5,\"inference_configuration\":" +
+                            inference_configuration + "}");
+                        return 0;
+                    }
+                }
             }
             rclcpp::init(argc, argv);
             ros_initialized = now();

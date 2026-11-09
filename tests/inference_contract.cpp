@@ -36,6 +36,28 @@ int main(int argc, char **argv) {
         CpuModel model(std::string(argv[1]) + "/data/mobilenetv2-12.onnx");
         require(model.intra_op_num_threads() == 1);
         require(processor_threads("1") == 1 && processor_threads("4") == 4);
+        for (const std::string role : {"source", "processor", "consumer"}) {
+            require(processor_options(role, {}, false).provider == "cpu");
+            require(processor_options(role, {"--provider", "cpu"}, false).provider == "cpu");
+            for (bool cuda_build : {false, true}) {
+                for (const std::vector<std::string> options : {
+                    std::vector<std::string>{}, {"--provider", "cpu"},
+                    {"--provider", "cuda"}, {"--provider", "invalid"},
+                    {"--provider"}, {"--provider", "cuda", "--intra-op-threads", "4"},
+                    {"--provider", "cuda", "--provider", "cuda"}}) {
+                    const bool expected = cuda_build
+                        ? role == "processor" && options == std::vector<std::string>{"--provider", "cuda"}
+                        : options.empty() || options == std::vector<std::string>{"--provider", "cpu"};
+                    bool accepted = false;
+                    try {
+                        processor_options(role, options, cuda_build);
+                        accepted = true;
+                    } catch (const std::invalid_argument &) {}
+                    require(accepted == expected);
+                }
+            }
+        }
+        require(processor_options("processor", {"--provider", "cuda", "--warmup-only"}, true).warmup_only);
         for (const std::string value : {"0", "2", "-1", "4x", "", "1.0"}) {
             bool rejected = false;
             try {

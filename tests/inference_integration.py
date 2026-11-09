@@ -40,7 +40,9 @@ def validate(path):
     if "processor_configuration" in manifest:
         threads = manifest["configuration"]["intra_op_threads"]
         applied = inference.verify_processor_configuration(
-            manifest["processor_configuration"], threads
+            manifest["processor_configuration"], threads,
+            **({"provider": "cuda", "expected_pid": manifest["nodes"]["processor"]["process_id"]}
+               if manifest["configuration"].get("provider") == "CUDAExecutionProvider" else {})
         )
         assert manifest["processor_readiness_configuration_verified"]
         assert manifest["processor_status_configuration_verified"]

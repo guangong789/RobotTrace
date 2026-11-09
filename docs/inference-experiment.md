@@ -1,6 +1,7 @@
-# MobileNetV2 ROS2 CPU 推理实验
+# MobileNetV2 ROS2 CPU/CUDA 推理实验
 
-当前唯一活跃推理模型为 MobileNetV2-12 FP32，使用 ONNX Runtime CPU 1.20.1。
+当前唯一活跃推理模型为 MobileNetV2-12 FP32，默认使用 ONNX Runtime CPU 1.20.1。
+CUDA Processor 需要显式选择独立 GPU 构建，Source/Consumer 继续使用 CPU 构建。
 复用原 Humble 镜像与 V1 事件采集、分析语义；不改变 V1 workload、上游集成或 Comparison Core。
 
 ## 准备、构建和运行
@@ -89,10 +90,10 @@ WSL2/Docker 原默认 localhost 环境曾出现间歇 discovery/readiness 超时
 只读离线摘要命令：
 
 ```sh
-python3 -B experiments/cpu_inference/load_summary.py <run-directory>
-python3 -B experiments/cpu_inference/latency_attribution.py <run-directory>
-python3 -B experiments/cpu_inference/e3_summary.py <e3-run-directory>
-python3 -B tests/inference_integration.py <successful-vision-run-directory>
+python3 -B experiments/cpu_inference/load_summary.py "<run-directory>"
+python3 -B experiments/cpu_inference/latency_attribution.py "<run-directory>"
+python3 -B experiments/cpu_inference/e3_summary.py "<e3-run-directory>"
+python3 -B tests/inference_integration.py "<successful-vision-run-directory>"
 python3 -B -m unittest discover -s tests
 ```
 
@@ -109,3 +110,76 @@ Processor 的可选 CPU 时间/峰值 RSS 覆盖初始化、warm-up、等待、�
 
 历史证据不重写、不自动压缩；SDK、模型数据和构建产物与源码分开保存。
 文中的历史 evidence 路径指本地保留记录，不随 Git 源码发布；新检出通过新的运行生成自己的证据。
+
+## 显式 CUDA Processor
+
+CPU 默认命令和 SDK 不变。GPU 复用 `pipeline.cpp`，以独立 CMake build tree、
+`ROBOTTRACE_CUDA_BUILD=ON` 和 `/opt/rt/ort` GPU SDK 生成 `inference_pipeline_cuda`。
+GPU 入口需要已经核验的依赖，构建脚本不下载依赖、不安装或重配系统环境：
+
+- GPU ORT 1.20.1：`.deps/gpu/onnxruntime-linux-x64-gpu-1.20.1/`，与 CPU SDK 分开保存。
+- cuDNN 9.3.0.75：`.deps/gpu/cudnn-linux-x86_64-9.3.0.75_cuda12-archive/lib/`。
+- 既有 WSL GPU 驱动、`/usr/local/cuda-12.4/targets/x86_64-linux/lib/` 中所需运行库，
+  以及已配置的 CDI 设备 `nvidia.com/gpu=all`。入口固定校验现有 Humble 镜像及 GPU ORT 库身份，
+  仅挂载所需 CUDA/cuDNN 库；不修改 Docker/CDI 或全局加载配置。
+
+为 CPU/GPU 分别选择尚不存在的 `bin/` 直接子目录和新日志。以下示例名称若已使用，应先换名。
+CPU 的 `ROBOTTRACE_INFERENCE_OUTPUT` 覆盖拒绝旧 `bin/inference/`、已有目录和路径穿越；
+省略覆盖时仍保持原 CPU 默认行为。本地历史 `bin/inference/` 不应作为下面的新构建目标。
+
+```sh
+ROBOTTRACE_INFERENCE_OUTPUT=bin/inference_cpu_checkpoint \
+ROBOTTRACE_BUILD_LOG=evidence/checkpoint-cpu-build.log scripts/build-inference.sh
+ROBOTTRACE_INFERENCE_OUTPUT=bin/inference_cuda_checkpoint \
+ROBOTTRACE_BUILD_LOG=evidence/checkpoint-gpu-build.log scripts/build-inference-gpu.sh
+
+python3 -B -m robottrace.inference --provider cuda \
+  --cpu-artifact-dir bin/inference_cpu_checkpoint \
+  --cuda-artifact-dir bin/inference_cuda_checkpoint \
+  --count 5 --rate 5 --intra-op-threads 1
+```
+
+构建在隔离临时目录中执行，不申请 CDI 设备；GPU 构建中的 C++ 数值契约使用 CPU provider，
+不能代替下面的实际 CUDA warm-up 验证。
+运行器的 `--provider cuda --cuda-artifact-dir <GPU目录> --cpu-artifact-dir <CPU目录>`
+分别校验两份清单，并仅用 GPU 二进制启动 Processor；Source/Consumer 使用 CPU 二进制和 CPU SDK。
+已有 CPU 产物可配合 `--cpu-source-root <构建时实际源码快照>` 校验：原清单每项仍必须匹配，
+仅源码从显式快照读取，二进制、SDK、模型和 fixture 仍读取实际文件。默认仍对当前源码校验。
+快照必须在源码改动前保存，不能通过改写清单适配旧产物。
+
+CPU 二进制接受省略 provider 或 `cpu`，拒绝 `cuda`。GPU 二进制只接受
+`processor --provider cuda --intra-op-threads 1`，拒绝缺省、CPU、其他角色和四线程。
+GPU 入口 `scripts/ros-inference-gpu.sh` 要求独立 `ROBOTTRACE_EVIDENCE_DIR`，
+仅该目录可写；SDK、项目源码及固定 CUDA/cuDNN 库只读挂载。
+运行显式申请 `nvidia.com/gpu=all`，保留原 host 网络、host IPC、domain 42 和 localhost/FastDDS 设置。
+共享容器内所有角色均可见 GPU；这里保证的是 provider/构建/加载隔离，不是每进程设备隔离。
+失败的新容器保留，成功后仅删除本次容器。
+
+CUDA 初始化设置 device 0、`use_tf32=0`；请求、构建模式、注册、Session、readback、实际加载库路径/哈希分别留证。
+CUDA Graph readback 缺失保持未知。五次原有数值 warm-up 后关闭 profile，按实际
+`model_run` 区间和 PID/TID 唯一归组，每次必须为 101 个 CUDA 节点和
+`Gather_100`、`Unsqueeze_101`、`Concat_102` 三个 CPU 辅助节点。
+缺失、模糊归组、额外回退或加载库身份错误均阻止 ROS2 初始化，不用总节点数代替逐次证明。
+`processor.warmup*.json`、`processor.cuda-execution.json` 和
+`processor.warmup-numerical.jsonl` 保存在本次目录；warm-up 不进入九事件追踪，也不作为性能结果。
+
+GPU 二进制的 `--warmup-only` 在上述门禁后、`rclcpp::init` 前退出，供隔离初始化验证。
+它不创建 ROS2 节点或处理 Source 消息，不能证明三进程功能、readiness 或性能。
+同步 `Session::Run()`、主机 tensor、输出复制、数值容差、QoS、所有 readiness 预算及消息计时边界保持原样。
+
+## GPU 接入的验证边界
+
+以下是本地保留的历史结果，证据目录不随源码发布：
+
+| 阶段 | 已建立的结果 | 本地证据目录 |
+| --- | --- | --- |
+| G1-02B0 | 独立 CPU 重建和五消息 smoke 通过，45 个完整事件。 | `evidence/g102b0_20261109T070857Z/` |
+| G1-02B1/B1R | 独立 CPU/GPU 构建完成；B1R 实际 CUDA 门禁通过，五次各 101 CUDA 节点和三个已知 CPU 辅助节点，5,000 个 warm-up 输出通过独立参考校验。 | `evidence/g102b1_20261109T073526Z/`、`evidence/g102b1r_20261109T080410Z/` |
+| G1-02C、C-R1 | 两次未添加图诊断的 GPU 功能尝试均为 FAIL：冻结 `1/1/0/1`，未释放 Source。 | `evidence/g102c_20261109T114310Z/`、`evidence/g102c_r1_20261109T120407Z/` |
+| G1-02E-R2 | 添加临时图诊断的运行达到 `1/1/1/1`，五消息功能与数值校验通过，45 个事件、零丢弃；诊断后处理失败，原任务仍为 PARTIAL。 | `evidence/g102e_r2_20261109T125838Z/` |
+| G1-02E-R3 | 纯离线恢复全部 51 条图观测；采样的清理前区间存在 Processor Reader 图可见性缺失，根因仍未确认。未改写 R2 的 PARTIAL。 | `evidence/g102e_r3_20261109T132252Z/` |
+
+临时端点图诊断及其恢复工具只在本地 evidence 中，未进入生产 pipeline。
+目前没有未添加图诊断的 GPU 三进程功能 PASS；上述 instrumented smoke 不证明 DDS 启动可靠性已解决。
+图可见性、matched-count、ready 持久化和实际消息交付是不同观测，跨进程采样并不同时发生。
+这个工程检查点不宣称 ROS2 GPU 加速比、吞吐或延迟改进。
