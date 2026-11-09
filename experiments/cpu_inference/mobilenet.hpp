@@ -95,6 +95,12 @@ namespace vision {
         std::string spinning_entry;
     };
 
+    // 仅由独立验证入口传入；省略时保留原有 CPU 配置和计时行为。
+    struct StandaloneSessionOptions {
+        std::string provider = "cpu", profile_prefix, cuda_options;
+        bool provider_registered = false, session_created = false;
+    };
+
     class CpuModel {
         Ort::Env environment_{ORT_LOGGING_LEVEL_WARNING, "robottrace-vision"};
         std::unique_ptr<Ort::Session> session_;
@@ -103,7 +109,8 @@ namespace vision {
     public:
         explicit CpuModel(const std::string &path, int intra_op_num_threads = 1,
             SessionConstructionMeasurement *measurement = nullptr,
-            bool disable_intra_op_spinning = false) {
+            bool disable_intra_op_spinning = false,
+            StandaloneSessionOptions *standalone = nullptr) {
             if (intra_op_num_threads <= 0)
                 throw std::invalid_argument("intra_op_num_threads must be positive");
             if (disable_intra_op_spinning && !measurement)
@@ -113,7 +120,39 @@ namespace vision {
             options.SetIntraOpNumThreads(intra_op_num_threads);
             options.SetInterOpNumThreads(1);
             options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
-            Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CPU(options, 1));
+            if (standalone && standalone->provider != "cpu" &&
+                standalone->provider != "cuda")
+                throw std::invalid_argument("provider must be cpu or cuda");
+            if (standalone && standalone->provider == "cuda") {
+                const auto available = Ort::GetAvailableProviders();
+                if (std::find(available.begin(), available.end(),
+                        "CUDAExecutionProvider") == available.end())
+                    throw std::runtime_error("CUDAExecutionProvider is unavailable");
+                const auto &api = Ort::GetApi();
+                OrtCUDAProviderOptionsV2 *raw = nullptr;
+                Ort::ThrowOnError(api.CreateCUDAProviderOptions(&raw));
+                std::unique_ptr<OrtCUDAProviderOptionsV2,
+                    decltype(api.ReleaseCUDAProviderOptions)>
+                    cuda(raw, api.ReleaseCUDAProviderOptions);
+                const char *keys[]{"device_id", "use_tf32"}, *values[]{"0", "0"};
+                Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
+                    cuda.get(), keys, values, 2));
+                Ort::AllocatorWithDefaultOptions allocator;
+                char *text = nullptr;
+                Ort::ThrowOnError(api.GetCUDAProviderOptionsAsString(
+                    cuda.get(), allocator, &text));
+                standalone->cuda_options = text;
+                allocator.Free(text);
+                options.AppendExecutionProvider_CUDA_V2(*cuda);
+            } else {
+                Ort::ThrowOnError(
+                    OrtSessionOptionsAppendExecutionProvider_CPU(options, 1));
+            }
+            if (standalone) {
+                standalone->provider_registered = true;
+                if (!standalone->profile_prefix.empty())
+                    options.EnableProfiling(standalone->profile_prefix.c_str());
+            }
             if (disable_intra_op_spinning)
                 options.AddConfigEntry(kOrtSessionOptionsConfigAllowIntraOpSpinning, "0");
             if (measurement) {
@@ -130,6 +169,8 @@ namespace vision {
             }
             session_ =
                 std::make_unique<Ort::Session>(environment_, path.c_str(), options);
+            if (standalone)
+                standalone->session_created = true;
             if (measurement) {
                 measurement->cpu_end = process_cpu_ns();
                 measurement->wall_end = clock_ns();
@@ -167,6 +208,11 @@ namespace vision {
 
         bool session_alive() const {
             return session_ != nullptr;
+        }
+
+        std::string finish_profile() {
+            Ort::AllocatorWithDefaultOptions allocator;
+            return session_->EndProfilingAllocated(allocator).get();
         }
 
         void run(Tensor &input, Call &call) {
